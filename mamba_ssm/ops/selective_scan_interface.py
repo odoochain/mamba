@@ -14,7 +14,42 @@ except ImportError:
     causal_conv1d_cuda = None
 
 import selective_scan_cuda
+from bllama.quantization import activation_quant
 
+def F_bitlinear(x, weight, rms_norm, inference=False, weight_scale=None):
+    w = weight
+    if not inference:
+        x_norm = rms_norm(x)
+        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
+        w_quant = w + (weight_quant(w) - w).detach()
+        return F.linear(x_quant, w_quant)
+    else:
+        assert weight_scale is not None, "weight_scale must be provided for inference"
+        # in case of inference, the weights are offline quantized to int8, so we assume w = w_quant
+        x_norm = rms_norm(x)
+        x_quant, x_scale = activation_post_quant(x_norm)
+        w_scale = weight_scale
+        # according to the paper, this linear layer may have to be replaced by a gemm_lowbit_kernel,
+        # but no such kernel is available, nor any directions on how to implement it, so we'll just use linear
+        return F.linear(x_quant, w.float()) / (x_scale * w_scale)
+
+
+def F_bitlinear_bias(x, weight, bias, rms_norm, inference=False, weight_scale=None):
+    w = weight
+    if not inference:
+        x_norm = rms_norm(x)
+        x_quant = x_norm + (activation_quant(x_norm) - x_norm).detach()
+        w_quant = w + (weight_quant(w) - w).detach()
+        return F.linear(x_quant, w_quant, bias)
+    else:
+        assert weight_scale is not None, "weight_scale must be provided for inference"
+        # in case of inference, the weights are offline quantized to int8, so we assume w = w_quant
+        x_norm = rms_norm(x)
+        x_quant, x_scale = activation_post_quant(x_norm)
+        w_scale = weight_scale
+        # according to the paper, this linear layer may have to be replaced by a gemm_lowbit_kernel,
+        # but no such kernel is available, nor any directions on how to implement it, so we'll just use linear
+        return F.linear(x_quant, w.float(), bias) / (x_scale * w_scale)
 
 class SelectiveScanFn(torch.autograd.Function):
 
@@ -161,10 +196,14 @@ class MambaInnerFn(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
-    def forward(ctx, xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
+    def forward(ctx, xz, conv1d_weight, conv1d_bias,
+                x_proj_weight,
+                delta_proj_weight,
                 out_proj_weight, out_proj_bias,
                 A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-                C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1):
+                C_proj_bias=None, delta_softplus=True, checkpoint_lvl=1,
+                inference=False, weight_scale=None,
+                ):
         """
              xz: (batch, dim, seqlen)
         """
@@ -183,6 +222,7 @@ class MambaInnerFn(torch.autograd.Function):
             xz = xz.contiguous()
         conv1d_weight = rearrange(conv1d_weight, "d 1 w -> d w")
         x, z = xz.chunk(2, dim=1)
+
         conv1d_bias = conv1d_bias.contiguous() if conv1d_bias is not None else None
         conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(
             x, conv1d_weight, conv1d_bias, None, None, None, True
@@ -190,7 +230,7 @@ class MambaInnerFn(torch.autograd.Function):
         # We're being very careful here about the layout, to avoid extra transposes.
         # We want delta to have d as the slowest moving dimension
         # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
-        x_dbl = F.linear(rearrange(conv1d_out, 'b d l -> (b l) d'), x_proj_weight)  # (bl d)
+        x_dbl = F.linear(rearrange(conv1d_out, 'b d l -> (b l) d'), x_proj_weight, inference, weight_scale)  # (bl d)
         delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(), "d (b l) -> b d l", l = L)
         ctx.is_variable_B = B is None
         ctx.is_variable_C = C is None
@@ -233,7 +273,7 @@ class MambaInnerFn(torch.autograd.Function):
         ctx.save_for_backward(xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight,
                               delta_proj_weight, out_proj_weight, conv1d_out, delta,
                               A, B, C, D, delta_bias, scan_intermediates, out)
-        return F.linear(rearrange(out_z, "b d l -> b l d"), out_proj_weight, out_proj_bias)
+        return F_bitlinear_bias(rearrange(out_z, "b d l -> b l d"), out_proj_weight, out_proj_bias)
 
     @staticmethod
     @custom_bwd
@@ -309,19 +349,25 @@ class MambaInnerFn(torch.autograd.Function):
 
 
 def mamba_inner_fn(
-    xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
-    out_proj_weight, out_proj_bias,
+    xz, conv1d_weight, conv1d_bias,
+    x_proj_weight, x_proj_rms_norm,
+    delta_proj_weight, delta_proj_rms_norm,
+    out_proj_weight, out_proj_bias, out_proj_rms_norm,
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
-    C_proj_bias=None, delta_softplus=True
+    C_proj_bias=None, delta_softplus=True,
+    inference=False, weight_scale=None,
 ):
     return MambaInnerFn.apply(xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                               out_proj_weight, out_proj_bias,
-                              A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, delta_softplus)
+                              rms_norm,
+                              A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, delta_softplus,
+                              inference=inference, weight_scale=weight_scale)
 
 
 def mamba_inner_ref(
     xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
     out_proj_weight, out_proj_bias,
+    rms_norm,
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
     C_proj_bias=None, delta_softplus=True
 ):

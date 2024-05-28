@@ -27,6 +27,9 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
+from bllama.quantization import weight_quant, activation_post_quant
+from bllama.bitlinear import BitLinear
+
 
 class Mamba(nn.Module):
     def __init__(
@@ -59,7 +62,7 @@ class Mamba(nn.Module):
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
 
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.in_proj = BitLinear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
@@ -74,10 +77,10 @@ class Mamba(nn.Module):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        self.x_proj = nn.Linear(
+        self.x_proj = BitLinear(
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
         )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+        self.dt_proj = BitLinear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
 
         # Initialize special dt projection to preserve variance at initialization
         dt_init_std = self.dt_rank**-0.5 * dt_scale
@@ -114,7 +117,7 @@ class Mamba(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
         self.D._no_weight_decay = True
 
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.out_proj = BitLinear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
     def forward(self, hidden_states, inference_params=None):
         """
@@ -122,6 +125,13 @@ class Mamba(nn.Module):
         Returns: same shape as hidden_states
         """
         batch, seqlen, dim = hidden_states.shape
+
+        is_inference = False
+
+        in_proj_w = self.in_proj.weight
+        in_proj_w_scale = self.in_proj.weight_scale
+        if not is_inference:
+            in_proj_w = in_proj_w + (weight_quant(in_proj_w) - in_proj_w).detach()
 
         conv_state, ssm_state = None, None
         if inference_params is not None:
@@ -132,11 +142,22 @@ class Mamba(nn.Module):
                 return out
 
         # We do matmul and transpose BLH -> HBL at the same time
-        xz = rearrange(
-            self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
-            "d (b l) -> b d l",
-            l=seqlen,
-        )
+        if not is_inference:
+            xz = rearrange(hidden_states, "b l d -> d (b l)")
+            xz_quant = xz + (activation_quant(xz) - xz).detach()
+            xz = rearrange(
+                in_proj_w @ xz_quant,
+                "d (b l) -> b d l",
+                l=seqlen,
+            )
+        else:
+            xz = rearrange(hidden_states, "b l d -> d (b l)")
+            xz_quant, xz_scale = activation_post_quant(xz)
+            xz = rearrange(
+                in_proj_w.float() @ xz_quant,
+                "d (b l) -> b d l",
+                l=seqlen,
+            ) / (xz_scale * in_proj_w_scale)
         if self.in_proj.bias is not None:
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
 
@@ -157,6 +178,7 @@ class Mamba(nn.Module):
                 self.D.float(),
                 delta_bias=self.dt_proj.bias.float(),
                 delta_softplus=True,
+                inference=is_inference
             )
         else:
             x, z = xz.chunk(2, dim=1)
