@@ -17,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "torch",
+    "pytorch_lightning",
     "ninja",
     "einops",
     "triton",
